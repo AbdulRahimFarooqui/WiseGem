@@ -6,8 +6,7 @@ Deploy to: Railway (with PostgreSQL plugin)
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import psycopg2
-import psycopg2.extras
+import pg8000.native
 import hashlib
 import secrets
 import json
