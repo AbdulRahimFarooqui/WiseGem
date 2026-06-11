@@ -21,21 +21,25 @@ app = Flask(__name__)
 CORS(app, origins=["chrome-extension://*", "https://wisegem.ai"])
 
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Firebase Init
-# Reads service account JSON from env var
+# Reads service account JSON from env var safely
 # ─────────────────────────────────────────────
 try:
     cred_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if cred_json:
+    if cred_json and cred_json.strip():  # Added a check to make sure it's not empty
         cred_dict = json.loads(cred_json)
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
+        print("✅ Firebase connected via JSON environment variable")
     else:
-        firebase_admin.initialize_app()   # fallback for local dev
+        # If the variable doesn't exist, safely fall back without crashing
+        print("ℹ️ GOOGLE_APPLICATION_CREDENTIALS_JSON not found. Initializing fallback...")
+        firebase_admin.initialize_app()   
+        print("✅ Firebase connected (Fallback/Local Dev mode)")
     db_firestore = firestore.client()
-    print("✅ Firebase connected")
 except Exception as e:
-    print(f"⚠️  Firebase not configured: {e}")
+    print(f"⚠️ Firebase not configured or failed to initialize: {e}")
     db_firestore = None
 
 # ─────────────────────────────────────────────
