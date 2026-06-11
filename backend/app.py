@@ -20,19 +20,17 @@ app = Flask(__name__)
 CORS(app, origins=["chrome-extension://*", "https://wisegem.ai"])
 
 # ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
 # Firebase Init
 # Reads service account JSON from env var safely
 # ─────────────────────────────────────────────
 try:
     cred_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if cred_json and cred_json.strip():  # Added a check to make sure it's not empty
+    if cred_json and cred_json.strip():
         cred_dict = json.loads(cred_json)
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
         print("✅ Firebase connected via JSON environment variable")
     else:
-        # If the variable doesn't exist, safely fall back without crashing
         print("ℹ️ GOOGLE_APPLICATION_CREDENTIALS_JSON not found. Initializing fallback...")
         firebase_admin.initialize_app()   
         print("✅ Firebase connected (Fallback/Local Dev mode)")
@@ -45,17 +43,12 @@ except Exception as e:
 # PostgreSQL — reads DATABASE_URL set by Railway
 # ─────────────────────────────────────────────
 def get_db():
-    conn = psycopg2.connect(
-        os.environ["DATABASE_URL"],
-        cursor_factory=psycopg2.extras.RealDictCursor
-    )
-    conn.autocommit = False
+    conn = pg8000.native.Connection.from_url(os.environ["DATABASE_URL"])
     return conn
 
 def init_db():
     conn = get_db()
-    cur  = conn.cursor()
-    cur.execute("""
+    conn.run("""
         CREATE TABLE IF NOT EXISTS licenses (
             key         TEXT PRIMARY KEY,
             plan        TEXT DEFAULT 'basic',
@@ -66,7 +59,8 @@ def init_db():
             email       TEXT,
             notes       TEXT
         );
-
+    """)
+    conn.run("""
         CREATE TABLE IF NOT EXISTS devices (
             id           SERIAL PRIMARY KEY,
             license_key  TEXT,
@@ -76,7 +70,8 @@ def init_db():
             last_seen    TEXT,
             UNIQUE (license_key, device_id)
         );
-
+    """)
+    conn.run("""
         CREATE TABLE IF NOT EXISTS sessions (
             id          SERIAL PRIMARY KEY,
             license_key TEXT,
@@ -87,8 +82,6 @@ def init_db():
             revoked     INTEGER DEFAULT 0
         );
     """)
-    conn.commit()
-    cur.close()
     conn.close()
     print("✅ Database initialized")
 
@@ -109,13 +102,17 @@ def token_required(f):
             return jsonify({"error": "No token provided"}), 401
 
         conn = get_db()
-        cur  = conn.cursor()
-        cur.execute("SELECT * FROM sessions WHERE token=%s AND revoked=0", (token,))
-        session = cur.fetchone()
-        cur.close(); conn.close()
+        # pg8000 returns named dictionaries for row lookups
+        res = conn.run("SELECT * FROM sessions WHERE token = :1 AND revoked = 0", token)
+        conn.close()
 
-        if not session:
+        if not res:
             return jsonify({"error": "Invalid token"}), 401
+        
+        # pg8000 mapping structure converts row array columns to dictionary pairs natively
+        columns = ["id", "license_key", "device_id", "token", "created_at", "expires_at", "revoked"]
+        session = dict(zip(columns, res[0]))
+
         if session["expires_at"] and datetime.fromisoformat(session["expires_at"]) < datetime.utcnow():
             return jsonify({"error": "Session expired"}), 401
 
@@ -149,62 +146,58 @@ def activate_license():
         return jsonify({"success": False, "error": "Missing license_key or device_id"}), 400
 
     conn = get_db()
-    cur  = conn.cursor()
+    res = conn.run("SELECT * FROM licenses WHERE key = :1", license_key)
 
-    cur.execute("SELECT * FROM licenses WHERE key=%s", (license_key,))
-    license = cur.fetchone()
-
-    if not license:
-        cur.close(); conn.close()
+    if not res:
+        conn.close()
         return jsonify({"success": False, "error": "Invalid license key"}), 404
 
+    lic_cols = ["key", "plan", "max_devices", "created_at", "expires_at", "status", "email", "notes"]
+    license = dict(zip(lic_cols, res[0]))
+
     if license["status"] == "revoked":
-        cur.close(); conn.close()
+        conn.close()
         return jsonify({"success": False, "error": "This license has been revoked"}), 403
 
     if license["expires_at"]:
         if datetime.fromisoformat(license["expires_at"]) < datetime.utcnow():
-            cur.execute("UPDATE licenses SET status='expired' WHERE key=%s", (license_key,))
-            conn.commit()
-            cur.close(); conn.close()
+            conn.run("UPDATE licenses SET status='expired' WHERE key = :1", license_key)
+            conn.close()
             return jsonify({"success": False, "error": "License has expired"}), 403
 
-    # Check if device already registered
-    cur.execute("SELECT * FROM devices WHERE license_key=%s AND device_id=%s", (license_key, device_id))
-    existing_device = cur.fetchone()
+    existing_device = conn.run("SELECT * FROM devices WHERE license_key = :1 AND device_id = :2", license_key, device_id)
 
     if not existing_device:
-        cur.execute("SELECT COUNT(*) as c FROM devices WHERE license_key=%s", (license_key,))
-        device_count = cur.fetchone()["c"]
+        count_res = conn.run("SELECT COUNT(*) FROM devices WHERE license_key = :1", license_key)
+        device_count = count_res[0][0]
 
         if device_count >= license["max_devices"]:
-            cur.execute("SELECT device_name, activated_at FROM devices WHERE license_key=%s", (license_key,))
-            devices = cur.fetchall()
-            cur.close(); conn.close()
+            dev_rows = conn.run("SELECT device_name, activated_at FROM devices WHERE license_key = :1", license_key)
+            conn.close()
+            registered = [dict(zip(["device_name", "activated_at"], row)) for row in dev_rows]
             return jsonify({
                 "success": False,
                 "error": f"Maximum devices ({license['max_devices']}) reached for this license.",
-                "registered_devices": [dict(d) for d in devices]
+                "registered_devices": registered
             }), 403
 
-        cur.execute(
-            "INSERT INTO devices (license_key, device_id, device_name, activated_at, last_seen) VALUES (%s,%s,%s,%s,%s)",
-            (license_key, device_id, device_name, datetime.utcnow().isoformat(), datetime.utcnow().isoformat())
+        conn.run(
+            "INSERT INTO devices (license_key, device_id, device_name, activated_at, last_seen) VALUES (:1,:2,:3,:4,:5)",
+            license_key, device_id, device_name, datetime.utcnow().isoformat(), datetime.utcnow().isoformat()
         )
     else:
-        cur.execute(
-            "UPDATE devices SET last_seen=%s WHERE license_key=%s AND device_id=%s",
-            (datetime.utcnow().isoformat(), license_key, device_id)
+        conn.run(
+            "UPDATE devices SET last_seen = :1 WHERE license_key = :2 AND device_id = :3",
+            datetime.utcnow().isoformat(), license_key, device_id
         )
 
     token   = generate_session_token(license_key, device_id)
     expires = (datetime.utcnow() + timedelta(hours=24)).isoformat()
-    cur.execute(
-        "INSERT INTO sessions (license_key, device_id, token, created_at, expires_at) VALUES (%s,%s,%s,%s,%s)",
-        (license_key, device_id, token, datetime.utcnow().isoformat(), expires)
+    conn.run(
+        "INSERT INTO sessions (license_key, device_id, token, created_at, expires_at) VALUES (:1,:2,:3,:4,:5)",
+        license_key, device_id, token, datetime.utcnow().isoformat(), expires
     )
-    conn.commit()
-    cur.close(); conn.close()
+    conn.close()
 
     return jsonify({
         "success": True,
@@ -222,35 +215,34 @@ def validate_license():
         return jsonify({"valid": False}), 400
 
     conn = get_db()
-    cur  = conn.cursor()
-    cur.execute(
-        "SELECT s.*, l.status, l.plan FROM sessions s "
+    res = conn.run(
+        "SELECT s.license_key, s.device_id, s.expires_at, l.status, l.plan FROM sessions s "
         "JOIN licenses l ON s.license_key = l.key "
-        "WHERE s.token=%s AND s.revoked=0",
-        (token,)
+        "WHERE s.token = :1 AND s.revoked = 0",
+        token
     )
-    session = cur.fetchone()
 
-    if not session:
-        cur.close(); conn.close()
+    if not res:
+        conn.close()
         return jsonify({"valid": False, "reason": "invalid_token"})
 
+    session = dict(zip(["license_key", "device_id", "expires_at", "status", "plan"], res[0]))
+
     if session["expires_at"] and datetime.fromisoformat(session["expires_at"]) < datetime.utcnow():
-        cur.close(); conn.close()
+        conn.close()
         return jsonify({"valid": False, "reason": "session_expired"})
 
     if session["status"] != "active":
-        cur.close(); conn.close()
+        conn.close()
         return jsonify({"valid": False, "reason": "license_" + session["status"]})
 
     new_expiry = (datetime.utcnow() + timedelta(hours=24)).isoformat()
-    cur.execute("UPDATE sessions SET expires_at=%s WHERE token=%s", (new_expiry, token))
-    cur.execute(
-        "UPDATE devices SET last_seen=%s WHERE license_key=%s AND device_id=%s",
-        (datetime.utcnow().isoformat(), session["license_key"], session["device_id"])
+    conn.run("UPDATE sessions SET expires_at = :1 WHERE token = :2", new_expiry, token)
+    conn.run(
+        "UPDATE devices SET last_seen = :1 WHERE license_key = :2 AND device_id = :3",
+        datetime.utcnow().isoformat(), session["license_key"], session["device_id"]
     )
-    conn.commit()
-    cur.close(); conn.close()
+    conn.close()
 
     return jsonify({"valid": True, "plan": session["plan"]})
 
@@ -259,11 +251,9 @@ def validate_license():
 @token_required
 def deactivate_device():
     conn = get_db()
-    cur  = conn.cursor()
-    cur.execute("DELETE FROM devices WHERE license_key=%s AND device_id=%s", (request.license_key, request.device_id))
-    cur.execute("UPDATE sessions SET revoked=1 WHERE license_key=%s AND device_id=%s", (request.license_key, request.device_id))
-    conn.commit()
-    cur.close(); conn.close()
+    conn.run("DELETE FROM devices WHERE license_key = :1 AND device_id = :2", request.license_key, request.device_id)
+    conn.run("UPDATE sessions SET revoked = 1 WHERE license_key = :1 AND device_id = :2", request.license_key, request.device_id)
+    conn.close()
     return jsonify({"success": True, "message": "Device deactivated. You can now activate on another device."})
 
 
@@ -349,7 +339,6 @@ def create_license():
     notes      = data.get("notes", "")
     days_valid = data.get("days_valid")
 
-    # Accept an explicit key (from local manager) or generate one
     key = (data.get("license_key") or "").strip().upper()
     if not key:
         parts = [secrets.token_hex(2).upper() for _ in range(3)]
@@ -360,14 +349,12 @@ def create_license():
         expires = (datetime.utcnow() + timedelta(days=int(days_valid))).isoformat()
 
     conn = get_db()
-    cur  = conn.cursor()
-    cur.execute(
+    conn.run(
         "INSERT INTO licenses (key, plan, max_devices, created_at, expires_at, email, notes) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (key) DO NOTHING",
-        (key, plan, max_devs, datetime.utcnow().isoformat(), expires, email, notes)
+        "VALUES (:1,:2,:3,:4,:5,:6,:7) ON CONFLICT (key) DO NOTHING",
+        key, plan, max_devs, datetime.utcnow().isoformat(), expires, email, notes
     )
-    conn.commit()
-    cur.close(); conn.close()
+    conn.close()
 
     return jsonify({"success": True, "key": key, "plan": plan, "max_devices": max_devs, "expires_at": expires})
 
@@ -377,11 +364,9 @@ def create_license():
 def revoke_license():
     key  = request.get_json().get("license_key", "").upper()
     conn = get_db()
-    cur  = conn.cursor()
-    cur.execute("UPDATE licenses SET status='revoked' WHERE key=%s", (key,))
-    cur.execute("UPDATE sessions SET revoked=1 WHERE license_key=%s", (key,))
-    conn.commit()
-    cur.close(); conn.close()
+    conn.run("UPDATE licenses SET status='revoked' WHERE key = :1", key)
+    conn.run("UPDATE sessions SET revoked=1 WHERE license_key = :1", key)
+    conn.close()
     return jsonify({"success": True})
 
 
@@ -389,16 +374,18 @@ def revoke_license():
 @admin_required
 def list_licenses():
     conn = get_db()
-    cur  = conn.cursor()
-    cur.execute("SELECT * FROM licenses ORDER BY created_at DESC")
-    licenses = cur.fetchall()
+    rows = conn.run("SELECT * FROM licenses ORDER BY created_at DESC")
+    
+    lic_cols = ["key", "plan", "max_devices", "created_at", "expires_at", "status", "email", "notes"]
     result = []
-    for lic in licenses:
-        lic_dict = dict(lic)
-        cur.execute("SELECT device_name, activated_at, last_seen FROM devices WHERE license_key=%s", (lic["key"],))
-        lic_dict["devices"] = [dict(d) for d in cur.fetchall()]
+    
+    for row in rows:
+        lic_dict = dict(zip(lic_cols, row))
+        dev_rows = conn.run("SELECT device_name, activated_at, last_seen FROM devices WHERE license_key = :1", lic_dict["key"])
+        lic_dict["devices"] = [dict(zip(["device_name", "activated_at", "last_seen"], d)) for d in dev_rows]
         result.append(lic_dict)
-    cur.close(); conn.close()
+        
+    conn.close()
     return jsonify(result)
 
 
