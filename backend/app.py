@@ -43,7 +43,7 @@ except Exception as e:
 # PostgreSQL — reads DATABASE_URL set by Railway
 # ─────────────────────────────────────────────
 def get_db():
-    conn = pg8000.native.Connection.from_url(os.environ["DATABASE_URL"])
+    conn = pg8000.native.Connection.from_url("postgresql://postgres:GusSEaflPkeheaYkFafxaOYlLgjKuJBI@postgres.railway.internal:5432/railway")
     return conn
 
 def init_db():
